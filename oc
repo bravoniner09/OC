@@ -1,0 +1,249 @@
+#!/bin/bash
+dnf install -y bind-utils &> /dev/null
+rm -rf /var/www/html/* &> /dev/null
+rm -rf /tmp/rhcos-vmware.x86_64.ova &> /dev/null
+if [ "$1" = "" ]; then
+    echo "Please run the script as './openshiftbuilder.sh sXX 24xx replace XX to match"
+    exit
+else
+    echo "Starting Openshift Builder Script"
+fi
+if [ "$2" = "" ]; then
+    echo "Please run the script as './openshiftbuilder.sh sXX 24xx replace XX to match"
+    exit
+else
+    echo "Starting Openshift Builder Script"
+fi
+rm -rf /usr/local/bin/govc
+which govc 1>/dev/null 2>/dev/null
+if [ $? -ne 0 ]; then
+        echo "Installing govc..."
+        mkdir /tmp/govc
+        cd /tmp/govc
+        wget -nc https://github.com/vmware/govmomi/releases/download/v0.23.0/govc_linux_amd64.gz
+        gunzip govc_linux_amd64.gz
+        mv govc_linux_amd64 govc
+        echo "export GOVC_URL=https://f2vcsa01.$1.com" > /etc/profile.d/govcprofile.sh
+        echo "export GOVC_USERNAME=administrator@vsphere.local" >> /etc/profile.d/govcprofile.sh
+        echo "export GOVC_PASSWORD=Password@12" >> /etc/profile.d/govcprofile.sh
+        echo "export GOVC_DATASTORE=vsanDatastore" >> /etc/profile.d/govcprofile.sh
+        echo "export GOVC_INSECURE=true" >> /etc/profile.d/govcprofile.sh
+	echo "export KUBECONFIG=/root/openshift/install_dir/auth/kubeconfig" >> /etc/profile.d/govcprofile.sh
+        chmod 755 /etc/profile.d/govcprofile.sh
+        . /etc/profile.d/govcprofile.sh
+        /etc/profile.d/govcprofile.sh
+        sudo cp -rf govc /usr/local/bin
+        sudo chmod +x /usr/local/bin/govc
+        
+else
+        echo "govc already exists..."
+fi
+echo "Generating SSH Public Key"
+if [ -f "~/.ssh/id_rsa.pub" ]; then
+    echo "SSH Key exists, proceeding..."
+else
+    cat /dev/zero | ssh-keygen -q -N ""
+fi
+echo "Installing the required packages on f2bastion01"
+dnf install -y wget httpd  &> /dev/null
+echo "Enabling and Starting httpd service"
+systemctl enable --now httpd &> /dev/null
+systemctl disable firewalld &> /dev/null
+cd ~
+rm -rf ~/openshift
+mkdir ~/openshift
+cd ~/openshift
+mkdir install_dir
+wget -nc http://10.26.1.101/install-config.yaml
+sed -i "s/PULLSECRET/$(cat /tmp/pull-secret.txt)/g" install-config.yaml
+sed -i "s#SSHKEY#$(cat ~/.ssh/id_rsa.pub)#g" install-config.yaml
+sed -i "s/example/$1/g" install-config.yaml
+cp -pr install-config.yaml install_dir/.
+wget -nc http://10.26.1.101/openshift-install-linux.tar.gz
+tar -xzf openshift-install-linux.tar.gz
+./openshift-install create manifests --dir=install_dir
+cd install_dir
+rm -f openshift/99_openshift-cluster-api_master-machines-*.yaml openshift/99_openshift-cluster-api_worker-machineset-*.yaml
+sed -i "s/mastersSchedulable: true/mastersSchedulable: False/g" manifests/cluster-scheduler-02-config.yml
+cd ..
+./openshift-install create ignition-configs --dir=install_dir
+cp -pr install_dir/bootstrap.ign /var/www/html/
+chmod 755 /var/www/html/bootstrap.ign
+cd install_dir
+wget -nc http://10.26.1.101/append-bootstrap.ign
+sed -i "s/IPADDR/$(nmcli device show ens192 | grep IP4.ADDRESS | awk '{print $2}' | cut -d / -f 1)/g" append-bootstrap.ign
+base64 -w0 master.ign > master.64
+base64 -w0 worker.ign > worker.64
+base64 -w0 append-bootstrap.ign > append-bootstrap.64
+cd /tmp
+wget -nc http://10.26.1.101/rhcos-vmware.x86_64.ova
+govc vm.power -off=true f2bootstrap01.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.power -off=true f2cp01.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.power -off=true f2cp02.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.power -off=true f2cp03.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.power -off=true f2ce01.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.power -off=true f2ce02.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.power -off=true f2ce03.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.destroy f2bootstrap01.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.destroy f2cp01.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.destroy f2cp02.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.destroy f2cp03.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.destroy f2ce01.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.destroy f2ce02.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.destroy f2ce03.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+#######################################################
+rm -rf /tmp/options.json
+wget http://10.26.1.101/options.json
+govc ls /*/network | grep $2 > /tmp/pgnetwork
+sed -i "s#PORTGROUP#$(cat /tmp/pgnetwork)#g" /tmp/options.json
+#bootstrap=$(cat ~/openshift/install_dir/bootstrap.ign | base64 -w0)
+#sed -i -f /dev/stdin /tmp/options.json << EOF
+#s#CONFIGDATA#$(cat ~/openshift/install_dir/bootstrap.ign | base64 -w0)#g
+#EOF
+govc import.ova -name=f2bootstrap01.oc-cluster-001.$1.com -options=/tmp/options.json /tmp/rhcos-vmware.x86_64.ova
+nslookup f2bootstrap01.oc-cluster-001.$1.com | grep Address | tail -1 | awk '{print $2}' > /tmp/ip
+nmcli device show ens192 | grep IP4.GATEWAY | awk '{print $2}' > /tmp/gateway
+nmcli device show ens192 | grep IP4.DNS | head -1 | awk '{print $2}' > /tmp/dns
+IPCFG="ip=$(cat /tmp/ip)::$(cat /tmp/gateway):255.255.255.0:f2bootstrap01.oc-cluster-001.$1.com:ens192:off nameserver=$(cat /tmp/dns)"
+govc vm.change -vm f2bootstrap01.oc-cluster-001.$1.com -c=4 -m=16384 -e "guestinfo.afterburn.initrd.network-kargs=${IPCFG}"
+govc vm.change -vm f2bootstrap01.oc-cluster-001.$1.com -e "guestinfo.ignition.config.data=CHANGEME"
+govc vm.disk.change -vm f2bootstrap01.oc-cluster-001.$1.com -disk.key 2000 -size 120G
+read -p "run cat ~/openshift/install_dir/bootstrap.ign | base64 -w0 in a new ssh window on f2bastion01, copy the output to vm property guestinfo.ignition.config.data, and after completion press Enter to continue.... DO NOT PRESS ENTER UNTIL YOU COMPLETE THIS TASK"
+read -p "ARE YOU SURE YOU PERFORMED THE ABOVE TASK... PRESS ENTER TO CONTINUE..."
+#govc vm.info -e f2bootstrap01.oc-cluster-001.$1.com
+govc vm.power -on f2bootstrap01.oc-cluster-001.$1.com
+#######################################################
+#cp01
+rm -rf /tmp/options.json
+wget http://10.26.1.101/options.json
+govc ls /*/network | grep $2 > /tmp/pgnetwork
+sed -i "s#PORTGROUP#$(cat /tmp/pgnetwork)#g" /tmp/options.json
+cpmaster=$(cat ~/openshift/install_dir/master.ign | base64 -w0)
+sed -i "s#CONFIGDATA#$cpmaster#g" /tmp/options.json
+govc import.ova -name=f2cp01.oc-cluster-001.$1.com -options=/tmp/options.json /tmp/rhcos-vmware.x86_64.ova
+nslookup f2cp01.oc-cluster-001.$1.com | grep Address | tail -1 | awk '{print $2}' > /tmp/ip
+nmcli device show ens192 | grep IP4.GATEWAY | awk '{print $2}' > /tmp/gateway
+nmcli device show ens192 | grep IP4.DNS | head -1 | awk '{print $2}' > /tmp/dns
+IPCFG="ip=$(cat /tmp/ip)::$(cat /tmp/gateway):255.255.255.0:f2cp01.oc-cluster-001.$1.com:ens192:off nameserver=$(cat /tmp/dns)"
+govc vm.change -vm f2cp01.oc-cluster-001.$1.com -c=4 -m=16384 -e "guestinfo.afterburn.initrd.network-kargs=${IPCFG}"
+govc vm.disk.change -vm f2cp01.oc-cluster-001.$1.com -disk.key 2000 -size 120G
+#govc vm.info -e f2cp01.oc-cluster-001.$1.com
+govc vm.power -on f2cp01.oc-cluster-001.$1.com
+#######################################################
+#cp02
+rm -rf /tmp/options.json
+wget http://10.26.1.101/options.json
+govc ls /*/network | grep $2 > /tmp/pgnetwork
+sed -i "s#PORTGROUP#$(cat /tmp/pgnetwork)#g" /tmp/options.json
+cpmaster=$(cat ~/openshift/install_dir/master.ign | base64 -w0)
+sed -i "s#CONFIGDATA#$cpmaster#g" /tmp/options.json
+govc import.ova -name=f2cp02.oc-cluster-001.$1.com -options=/tmp/options.json /tmp/rhcos-vmware.x86_64.ova
+nslookup f2cp02.oc-cluster-001.$1.com | grep Address | tail -1 | awk '{print $2}' > /tmp/ip
+nmcli device show ens192 | grep IP4.GATEWAY | awk '{print $2}' > /tmp/gateway
+nmcli device show ens192 | grep IP4.DNS | head -1 | awk '{print $2}' > /tmp/dns
+IPCFG="ip=$(cat /tmp/ip)::$(cat /tmp/gateway):255.255.255.0:f2cp02.oc-cluster-001.$1.com:ens192:off nameserver=$(cat /tmp/dns)"
+govc vm.change -vm f2cp02.oc-cluster-001.$1.com -c=4 -m=16384 -e "guestinfo.afterburn.initrd.network-kargs=${IPCFG}"
+govc vm.disk.change -vm f2cp02.oc-cluster-001.$1.com -disk.key 2000 -size 120G
+#govc vm.info -e f2cp02.oc-cluster-001.$1.com
+govc vm.power -on f2cp02.oc-cluster-001.$1.com
+#######################################################
+#cp03
+rm -rf /tmp/options.json
+wget http://10.26.1.101/options.json
+govc ls /*/network | grep $2 > /tmp/pgnetwork
+sed -i "s#PORTGROUP#$(cat /tmp/pgnetwork)#g" /tmp/options.json
+cpmaster=$(cat ~/openshift/install_dir/master.ign | base64 -w0)
+sed -i "s#CONFIGDATA#$cpmaster#g" /tmp/options.json
+govc import.ova -name=f2cp03.oc-cluster-001.$1.com -options=/tmp/options.json /tmp/rhcos-vmware.x86_64.ova
+nslookup f2cp03.oc-cluster-001.$1.com | grep Address | tail -1 | awk '{print $2}' > /tmp/ip
+nmcli device show ens192 | grep IP4.GATEWAY | awk '{print $2}' > /tmp/gateway
+nmcli device show ens192 | grep IP4.DNS | head -1 | awk '{print $2}' > /tmp/dns
+IPCFG="ip=$(cat /tmp/ip)::$(cat /tmp/gateway):255.255.255.0:f2cp03.oc-cluster-001.$1.com:ens192:off nameserver=$(cat /tmp/dns)"
+govc vm.change -vm f2cp03.oc-cluster-001.$1.com -c=4 -m=16384 -e "guestinfo.afterburn.initrd.network-kargs=${IPCFG}"
+govc vm.disk.change -vm f2cp03.oc-cluster-001.$1.com -disk.key 2000 -size 120G
+#govc vm.info -e f2cp03.oc-cluster-001.$1.com
+govc vm.power -on f2cp03.oc-cluster-001.$1.com
+echo "Sleeping for the next five minutes $(date)"
+sleep 300
+#######################################################
+#ce01
+rm -rf /tmp/options.json
+wget http://10.26.1.101/options.json
+govc ls /*/network | grep $2 > /tmp/pgnetwork
+sed -i "s#PORTGROUP#$(cat /tmp/pgnetwork)#g" /tmp/options.json
+cemaster=$(cat ~/openshift/install_dir/worker.ign | base64 -w0)
+sed -i "s#CONFIGDATA#$cemaster#g" /tmp/options.json
+govc import.ova -name=f2ce01.oc-cluster-001.$1.com -options=/tmp/options.json /tmp/rhcos-vmware.x86_64.ova
+nslookup f2ce01.oc-cluster-001.$1.com | grep Address | tail -1 | awk '{print $2}' > /tmp/ip
+nmcli device show ens192 | grep IP4.GATEWAY | awk '{print $2}' > /tmp/gateway
+nmcli device show ens192 | grep IP4.DNS | head -1 | awk '{print $2}' > /tmp/dns
+IPCFG="ip=$(cat /tmp/ip)::$(cat /tmp/gateway):255.255.255.0:f2ce01.oc-cluster-001.$1.com:ens192:off nameserver=$(cat /tmp/dns)"
+govc vm.change -vm f2ce01.oc-cluster-001.$1.com -c=4 -m=16384 -e "guestinfo.afterburn.initrd.network-kargs=${IPCFG}"
+govc vm.disk.change -vm f2ce01.oc-cluster-001.$1.com -disk.key 2000 -size 120G
+#govc vm.info -e f2ce01.oc-cluster-001.$1.com
+govc vm.power -on f2ce01.oc-cluster-001.$1.com
+#######################################################
+#ce02
+rm -rf /tmp/options.json
+wget http://10.26.1.101/options.json
+govc ls /*/network | grep $2 > /tmp/pgnetwork
+sed -i "s#PORTGROUP#$(cat /tmp/pgnetwork)#g" /tmp/options.json
+cemaster=$(cat ~/openshift/install_dir/worker.ign | base64 -w0)
+sed -i "s#CONFIGDATA#$cemaster#g" /tmp/options.json
+govc import.ova -name=f2ce02.oc-cluster-001.$1.com -options=/tmp/options.json /tmp/rhcos-vmware.x86_64.ova
+nslookup f2ce02.oc-cluster-001.$1.com | grep Address | tail -1 | awk '{print $2}' > /tmp/ip
+nmcli device show ens192 | grep IP4.GATEWAY | awk '{print $2}' > /tmp/gateway
+nmcli device show ens192 | grep IP4.DNS | head -1 | awk '{print $2}' > /tmp/dns
+IPCFG="ip=$(cat /tmp/ip)::$(cat /tmp/gateway):255.255.255.0:f2ce02.oc-cluster-001.$1.com:ens192:off nameserver=$(cat /tmp/dns)"
+govc vm.change -vm f2ce02.oc-cluster-001.$1.com -c=4 -m=16384 -e "guestinfo.afterburn.initrd.network-kargs=${IPCFG}"
+govc vm.disk.change -vm f2ce02.oc-cluster-001.$1.com -disk.key 2000 -size 120G
+#govc vm.info -e f2ce02.oc-cluster-001.$1.com
+govc vm.power -on f2ce02.oc-cluster-001.$1.com
+#######################################################
+#ce03
+rm -rf /tmp/options.json
+wget http://10.26.1.101/options.json
+govc ls /*/network | grep $2 > /tmp/pgnetwork
+sed -i "s#PORTGROUP#$(cat /tmp/pgnetwork)#g" /tmp/options.json
+cemaster=$(cat ~/openshift/install_dir/worker.ign | base64 -w0)
+sed -i "s#CONFIGDATA#$cemaster#g" /tmp/options.json
+govc import.ova -name=f2ce03.oc-cluster-001.$1.com -options=/tmp/options.json /tmp/rhcos-vmware.x86_64.ova
+nslookup f2ce03.oc-cluster-001.$1.com | grep Address | tail -1 | awk '{print $2}' > /tmp/ip
+nmcli device show ens192 | grep IP4.GATEWAY | awk '{print $2}' > /tmp/gateway
+nmcli device show ens192 | grep IP4.DNS | head -1 | awk '{print $2}' > /tmp/dns
+IPCFG="ip=$(cat /tmp/ip)::$(cat /tmp/gateway):255.255.255.0:f2ce03.oc-cluster-001.$1.com:ens192:off nameserver=$(cat /tmp/dns)"
+govc vm.change -vm f2ce03.oc-cluster-001.$1.com -c=4 -m=16384 -e "guestinfo.afterburn.initrd.network-kargs=${IPCFG}"
+govc vm.disk.change -vm f2ce03.oc-cluster-001.$1.com -disk.key 2000 -size 120G
+#govc vm.info -e f2ce03.oc-cluster-001.$1.com
+govc vm.power -on f2ce03.oc-cluster-001.$1.com
+#######################################################
+#######################################################
+cd ~/openshift
+wget http://10.26.1.101/openshift-client-linux.tar.gz
+tar -xzf openshift-client-linux.tar.gz
+mv oc kubectl /usr/local/bin
+echo "Sleeping for 5 minutes for worker nodes to check in $(date)"
+sleep 300
+oc get csr -o go-template='{{range .items}}{{if not .status}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | xargs oc adm certificate approve
+sleep 60
+oc get csr -o go-template='{{range .items}}{{if not .status}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | xargs oc adm certificate approve
+govc vm.power -off=true f2bootstrap01.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+govc vm.destroy f2bootstrap01.oc-cluster-001.$1.com &> /dev/null
+sleep 1
+echo "Login to f2lb server, modify /etc/haproxy/haproxy.cfg file and remove all the LINES WITH f2bootstrap01.oc-cluster-001.$1.com"
+echo "Restart haproxy after completion.... systemctl restart haproxy"
